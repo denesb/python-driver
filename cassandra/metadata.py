@@ -2593,6 +2593,7 @@ class SchemaParserV3(SchemaParserV22):
     _SELECT_FUNCTIONS = "SELECT * FROM system_schema.functions"
     _SELECT_AGGREGATES = "SELECT * FROM system_schema.aggregates"
     _SELECT_VIEWS = "SELECT * FROM system_schema.views"
+    _SELECT_NONMATERIALIZED_VIEWS = "SELECT * FROM system_schema.nonmaterialized_views"
     _SELECT_SCYLLA = "SELECT * FROM system_schema.scylla_tables"
 
     _table_name_col = 'table_name'
@@ -2657,13 +2658,17 @@ class SchemaParserV3(SchemaParserV22):
         view_query = QueryMessage(
             query=maybe_add_timeout_to_query(self._SELECT_VIEWS + where_clause, self.metadata_request_timeout),
             consistency_level=cl, fetch_size=fetch_size)
+        nonmaterialized_view_query = QueryMessage(
+            query=maybe_add_timeout_to_query(self._SELECT_NONMATERIALIZED_VIEWS + where_clause, self.metadata_request_timeout),
+            consistency_level=cl, fetch_size=fetch_size)
         ((cf_success, cf_result), (col_success, col_result),
          (indexes_sucess, indexes_result), (triggers_success, triggers_result),
          (view_success, view_result),
+         (nonmaterialized_view_success, nonmaterialized_view_result),
          (scylla_success, scylla_result)) = (
              self.connection.wait_for_responses(
                  cf_query, col_query, indexes_query, triggers_query,
-                 view_query, scylla_query, timeout=self.timeout, fail_on_error=False)
+                 view_query, nonmaterialized_view_query, scylla_query, timeout=self.timeout, fail_on_error=False)
         )
         table_result = self._handle_results(cf_success, cf_result, query_msg=cf_query)
         col_result = self._handle_results(col_success, col_result, query_msg=col_query)
@@ -2682,6 +2687,10 @@ class SchemaParserV3(SchemaParserV22):
             return self._build_table_metadata(table_result[0], col_result, triggers_result, indexes_result)
 
         view_result = self._handle_results(view_success, view_result, query_msg=view_query)
+        if view_result:
+            return self._build_view_metadata(view_result[0], col_result)
+        
+        view_result = self._handle_results(nonmaterialized_view_success, nonmaterialized_view_result, query_msg=nonmaterialized_view_query)
         if view_result:
             return self._build_view_metadata(view_result[0], col_result)
 
@@ -2846,6 +2855,8 @@ class SchemaParserV3(SchemaParserV22):
                          fetch_size=fetch_size, consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIEWS, self.metadata_request_timeout),
                          fetch_size=fetch_size, consistency_level=cl),
+            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_NONMATERIALIZED_VIEWS, self.metadata_request_timeout),
+                         fetch_size=fetch_size, consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_SCYLLA, self.metadata_request_timeout),
                          fetch_size=fetch_size, consistency_level=cl),
         ]
@@ -2859,6 +2870,7 @@ class SchemaParserV3(SchemaParserV22):
          (triggers_success, triggers_result),
          (indexes_success, indexes_result),
          (views_success, views_result),
+         (nonmaterialized_views_success, nonmaterialized_views_result),
          (scylla_success, scylla_result)) = self.connection.wait_for_responses(
              *queries, timeout=self.timeout, fail_on_error=False
         )
@@ -2872,7 +2884,8 @@ class SchemaParserV3(SchemaParserV22):
         self.aggregates_result = self._handle_results(aggregates_success, aggregates_result, query_msg=queries[5])
         self.indexes_result = self._handle_results(indexes_success, indexes_result, query_msg=queries[7])
         self.views_result = self._handle_results(views_success, views_result, query_msg=queries[8])
-        self.scylla_result = self._handle_results(scylla_success, scylla_result, expected_failures=(InvalidRequest,), query_msg=queries[9])
+        self.nonmaterialized_views_result = self._handle_results(nonmaterialized_views_success, nonmaterialized_views_result, query_msg=queries[9])
+        self.scylla_result = self._handle_results(scylla_success, scylla_result, expected_failures=(InvalidRequest,), query_msg=queries[10])
 
         self._aggregate_results()
 
@@ -2887,6 +2900,8 @@ class SchemaParserV3(SchemaParserV22):
 
         m = self.keyspace_view_rows
         for row in self.views_result:
+            m[row["keyspace_name"]].append(row)
+        for row in self.nonmaterialized_views_result:
             m[row["keyspace_name"]].append(row)
 
     @staticmethod
@@ -2956,6 +2971,8 @@ class SchemaParserV4(SchemaParserV3):
                          fetch_size=fetch_size, consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIEWS, self.metadata_request_timeout),
                          fetch_size=fetch_size, consistency_level=cl),
+            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_NONMATERIALIZED_VIEWS, self.metadata_request_timeout),
+                         fetch_size=fetch_size, consistency_level=cl),
             # V4-only queries
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIRTUAL_KEYSPACES, self.metadata_request_timeout),
                          fetch_size=fetch_size, consistency_level=cl),
@@ -2978,6 +2995,7 @@ class SchemaParserV4(SchemaParserV3):
             (triggers_success, triggers_result),
             (indexes_success, indexes_result),
             (views_success, views_result),
+            (nonmaterialized_views_success, nonmaterialized_views_result),
             # V4-only responses
             (virtual_ks_success, virtual_ks_result),
             (virtual_table_success, virtual_table_result),
@@ -2994,20 +3012,21 @@ class SchemaParserV4(SchemaParserV3):
         self.aggregates_result = self._handle_results(aggregates_success, aggregates_result, query_msg=queries[5])
         self.indexes_result = self._handle_results(indexes_success, indexes_result, query_msg=queries[7])
         self.views_result = self._handle_results(views_success, views_result, query_msg=queries[8])
+        self.nonmaterialized_views_result = self._handle_results(views_success, views_result, query_msg=queries[9])
         # V4-only results
         # These tables don't exist in some DSE versions reporting 4.X so we can
         # ignore them if we got an error
         self.virtual_keyspaces_result = self._handle_results(
             virtual_ks_success, virtual_ks_result,
-            expected_failures=(InvalidRequest,), query_msg=queries[9]
+            expected_failures=(InvalidRequest,), query_msg=queries[10]
         )
         self.virtual_tables_result = self._handle_results(
             virtual_table_success, virtual_table_result,
-            expected_failures=(InvalidRequest,), query_msg=queries[10]
+            expected_failures=(InvalidRequest,), query_msg=queries[11]
         )
         self.virtual_columns_result = self._handle_results(
             virtual_column_success, virtual_column_result,
-            expected_failures=(InvalidRequest,), query_msg=queries[11]
+            expected_failures=(InvalidRequest,), query_msg=queries[12]
         )
 
         self._aggregate_results()
@@ -3184,6 +3203,7 @@ class SchemaParserDSE68(SchemaParserDSE67):
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_TRIGGERS, self.metadata_request_timeout), consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_INDEXES, self.metadata_request_timeout), consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIEWS, self.metadata_request_timeout), consistency_level=cl),
+            QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_NONMATERIALIZED_VIEWS, self.metadata_request_timeout), consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIRTUAL_KEYSPACES, self.metadata_request_timeout), consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIRTUAL_TABLES, self.metadata_request_timeout), consistency_level=cl),
             QueryMessage(query=maybe_add_timeout_to_query(self._SELECT_VIRTUAL_COLUMNS, self.metadata_request_timeout), consistency_level=cl),
@@ -3205,6 +3225,7 @@ class SchemaParserDSE68(SchemaParserDSE67):
             (triggers_success, triggers_result),
             (indexes_success, indexes_result),
             (views_success, views_result),
+            (nonmaterialized_views_success, nonmaterialized_views_result),
             (virtual_ks_success, virtual_ks_result),
             (virtual_table_success, virtual_table_result),
             (virtual_column_success, virtual_column_result),
@@ -3223,6 +3244,7 @@ class SchemaParserDSE68(SchemaParserDSE67):
         self.aggregates_result = self._handle_results(aggregates_success, aggregates_result)
         self.indexes_result = self._handle_results(indexes_success, indexes_result)
         self.views_result = self._handle_results(views_success, views_result)
+        self.nonmaterialized_views_result = self._handle_results(nonmaterialized_views_success, nonmaterialized_views_result)
 
         # These tables don't exist in some DSE versions reporting 4.X so we can
         # ignore them if we got an error
